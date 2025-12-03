@@ -112,6 +112,10 @@ void main() {
         if ((p.mask_n_head_log2 & MASK_ENABLE_BIT) != 0) {
             bool nem1_bounds_check = !(p.gqa_ratio > 1) && (p.nem1 % Br) != 0;
 
+            if (j > start_j) {
+                barrier();
+            }
+
             float max_mask = NEG_FLT_MAX_OVER_2;
             [[unroll]] for (uint32_t idx = 0; idx < Bc * Br; idx += gl_WorkGroupSize.x) {
                 uint32_t c = (idx + tid) % Bc;
@@ -193,7 +197,6 @@ void main() {
                     Sf[r][c] += slope[r]*mvf;
                 }
             }
-            barrier();
         }
 
         float rowmaxf[Br], Pf[Br][cols_per_thread], rowsumf[Br], eMf[Br], Moldf[Br];
@@ -252,8 +255,6 @@ void main() {
                 }
             }
         }
-
-        barrier();
     }
 
     // reduce across threads
