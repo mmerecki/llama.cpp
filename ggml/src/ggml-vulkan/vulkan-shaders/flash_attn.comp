@@ -132,7 +132,6 @@ void main() {
             }
             // skip the block if the mask is entirely -inf
             bool all_less = subgroupAll(max_mask <= NEG_FLT_MAX_OVER_2);
-            barrier();
             if (gl_SubgroupInvocationID == 0) {
                 tmpsh[gl_SubgroupID] = all_less ? NEG_FLT_MAX_OVER_2 : 0.0f;
             }
@@ -255,6 +254,10 @@ void main() {
                 }
             }
         }
+    }
+
+    if ((p.mask_n_head_log2 & MASK_ENABLE_BIT) != 0) {
+        barrier();
     }
 
     // reduce across threads
