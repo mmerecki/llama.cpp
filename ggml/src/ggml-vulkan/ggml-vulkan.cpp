@@ -2850,6 +2850,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
             m_warptile_mmq = m_warptile_mmq_int = { 256, 64, 64, 32, 16, 16, 2, 2, 2, 1, 16 };
             m_warptile_mmqid = m_warptile_mmqid_int = { 256, 64, 64, 32, 16, 16, 2, 2, 2, 1, 16 };
         } else if ((device->vendor_id == VK_VENDOR_ID_INTEL) &&
+                   NULL == getenv("GGML_VK_DISABLE_INTEL_WARPTILE_OVERRIDE") &&
                    (device->driver_id == vk::DriverId::eIntelProprietaryWindows)) {
             m_warptile = { 256, 64, 64, 16, 16, 32, 2, tm_m, tn_m, tk_m, 32 };
             s_warptile = { 64, 32, 32, 16, 16, 32, 2, tm_s, tn_s, tk_s, 32 };
@@ -2864,6 +2865,61 @@ static void ggml_vk_load_shaders(vk_device& device) {
         l_align = 128;
         m_align =  64;
         s_align =  32;
+
+        // Get a tile scaling factor from environment variable.
+        auto GetScale = [&](const char* name, const char* prefix, const char* variant) {
+            std::string var_name = std::string("GGML_VK_SCALE_") + prefix + "_";
+            if (variant) {
+                var_name += std::string(variant) + "_";
+            }
+            var_name += std::string(name);
+            std::transform(var_name.begin(), var_name.end(), var_name.begin(),
+                [](unsigned char c) { return std::toupper(c); }
+            );
+            const char* str = getenv(var_name.c_str());
+            double val = (str == NULL ? 1.0 : atof(str));
+            return val;
+        };
+        // Scale warptile sizes according to environment variables.
+        auto ApplyScalingFactors = [&](auto& warptile, auto& denoms, const char* prefix, const char* variant = nullptr) {
+            double scaleBM = GetScale("BM", prefix, variant);
+            double scaleBN = GetScale("BN", prefix, variant);
+            double scaleWM  = GetScale("WM", prefix, variant);
+            double scaleWN  = GetScale("WN", prefix, variant);
+
+            if (scaleBM == 1.0 && scaleBN == 1.0 && scaleWM == 1.0 && scaleWN == 1.0) {
+                return;
+            }
+            VK_LOG_DEBUG("Applying scaling factors to " + std::string(prefix) + "warptile" + (variant ? std::string("_") + std::string(variant) : std::string("")) +
+                ": BM=" + std::to_string(scaleBM) +
+                ", BN=" + std::to_string(scaleBN) +
+                ", WM=" + std::to_string(scaleWM) +
+                ", WN=" + std::to_string(scaleWN));
+
+            const uint32_t subgroupSize = warptile[10];
+            uint32_t& workgroupSize = warptile[0];
+            uint32_t& BM = warptile[1];
+            uint32_t& BN = warptile[2];
+            uint32_t& WM = warptile[4];
+            uint32_t& WN = warptile[5];
+
+            BM = (uint32_t)((double)BM * scaleBM);
+            BN = (uint32_t)((double)BN * scaleBN);
+            WM = (uint32_t)((double)WM * scaleWM);
+            WN = (uint32_t)((double)WN * scaleWN);
+
+            // Adjust workgroup size
+            workgroupSize = (BM * BN) / (WM * WN) * subgroupSize;
+
+            denoms[0] = BM;
+            denoms[1] = BN;
+        };
+        ApplyScalingFactors(l_warptile_mmq, l_mmq_wg_denoms, "l", "mmq");
+        ApplyScalingFactors(m_warptile_mmq, m_mmq_wg_denoms, "m", "mmq");
+        ApplyScalingFactors(s_warptile_mmq, s_mmq_wg_denoms, "s", "mmq");
+        ApplyScalingFactors(l_warptile, l_wg_denoms, "l");
+        ApplyScalingFactors(m_warptile, m_wg_denoms, "m");
+        ApplyScalingFactors(s_warptile, s_wg_denoms, "s");
 
         for (uint32_t i = 0; i < GGML_TYPE_COUNT; ++i) {
             ggml_type t = (ggml_type)i;
@@ -3118,17 +3174,17 @@ static void ggml_vk_load_shaders(vk_device& device) {
         // Create 6 variants, {s,m,l}x{unaligned,aligned}
 #define CREATE_MM(TYPE, PIPELINE_NAME, NAMELC, F16ACC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID) \
         if (device->mul_mat ## ID ## _l[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->l, #NAMELC #F16ACC "_l", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, l_ ## WARPTILE, 1, false, true);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->l, #NAMELC #F16ACC "_l", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, l_ ## WARPTILE, 1, false, true, l_ ## WARPTILE[10]);   \
         if (device->mul_mat ## ID ## _m[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->m, #NAMELC #F16ACC "_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, m_ ## WARPTILE, 1, false, true);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->m, #NAMELC #F16ACC "_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, m_ ## WARPTILE, 1, false, true, m_ ## WARPTILE[10]);   \
         if (device->mul_mat ## ID ## _s[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->s, #NAMELC #F16ACC "_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, s_ ## WARPTILE, 1, false, true);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->s, #NAMELC #F16ACC "_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, s_ ## WARPTILE, 1, false, true, s_ ## WARPTILE[10]);   \
         if (device->mul_mat ## ID ## _l[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_l, #NAMELC #F16ACC "_aligned_l", NAMELC ## _aligned ## F16ACC ## _cm1_len, NAMELC ## _aligned ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, l_ ## WARPTILE, l_align, false, true);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_l, #NAMELC #F16ACC "_aligned_l", NAMELC ## _aligned ## F16ACC ## _cm1_len, NAMELC ## _aligned ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, l_ ## WARPTILE, l_ ## WG_DENOMS[0], false, true, l_ ## WARPTILE[10]);   \
         if (device->mul_mat ## ID ## _m[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_m, #NAMELC #F16ACC "_aligned_m", NAMELC ## _aligned ## F16ACC ## _cm1_len, NAMELC ## _aligned ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, m_ ## WARPTILE, m_align, false, true);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_m, #NAMELC #F16ACC "_aligned_m", NAMELC ## _aligned ## F16ACC ## _cm1_len, NAMELC ## _aligned ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, m_ ## WARPTILE, m_ ## WG_DENOMS[0], false, true, m_ ## WARPTILE[10]);   \
         if (device->mul_mat ## ID ## _s[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC #F16ACC "_aligned_s", NAMELC ## _aligned ## F16ACC ## _cm1_len, NAMELC ## _aligned ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, s_ ## WARPTILE, s_align, false, true);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC #F16ACC "_aligned_s", NAMELC ## _aligned ## F16ACC ## _cm1_len, NAMELC ## _aligned ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, s_ ## WARPTILE, s_ ## WG_DENOMS[0], false, true, s_ ## WARPTILE[10]);   \
 
         // Create 2 variants, {f16,f32} accumulator
 #define CREATE_MM2(TYPE, PIPELINE_NAME, NAMELC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID) \
